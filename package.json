@@ -1,0 +1,11 @@
+{
+  "name": "legu2009",
+  "subdomain": "legu2009",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "version": "0.0.0-11",
+  "engines": {
+    "node": "0.10.x"
+  }
+}
