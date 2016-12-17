@@ -1,0 +1,180 @@
+﻿namespace nexon;
+import console;
+import thread;
+import fsys.ini;
+import win.path;
+var clog = ..console.log;
+var threadSet = ..thread.set;
+//{vpnStr;'拨号次数','拨号成功次数', 'ip不可以用次数', 'ip被封次数'}
+var writeIPFile = function(key, str){
+	if (!str) {
+		var index = thread.get("VPN_INDEX");
+		if (index == 0) return;
+		str = VPN_TABLE[index];
+	}
+	//..console.log('writeIPFile', key, str);
+	ipFiles[key].write(str , '\n');
+	ipFiles[key].flush();
+};
+vpn = class {
+	ctor(ide_opt) {
+		this.vpnTab = {};
+		this.rasdialPath = ..win.path.search("rasdial.exe");
+		this.iniBtn = ..fsys.ini("\配置文件.ini");
+		this.index = 0;
+		this.iniBtn.write("VPN_INDEX", "key", 0);
+		this.ipDisConnect =  ..io.open ( "/exprot/帐号-IP连接失败.txt", "a");
+		this.ipBlank =  ..io.open ( "/exprot/帐号-IP不可用.txt", "a");
+		this.ipOK = ..io.open ( "/exprot/帐号-IP可用.txt", "a");
+		this.ipHander = null;
+		this.id_vpn = "nexon_vpn_" + ..thread.getId();
+		this.isChange = false;
+
+	};
+	close =  function () {
+		this.ipDisConnect.close();
+		this.ipBlank.close();
+		this.ipOK.close();
+	};
+	setVpn = function (iplog) {
+		if (this.isChange) {
+			var str = this.vpnTab[this.index][1];
+			if (iplog.num60) {
+				this.vpnTab[this.index][5]++;
+				this.writeIPFile('ipBlank', str)
+			} else if (iplog.num40 > 0) {
+				this.writeIPFile('ipOK', str)
+			} else {
+				this.vpnTab[this.index][4]++;
+				this.writeIPFile('ipDisConnect', str)
+			}
+		}
+	};
+	writeIPFile = function (key, str) {
+		this[key].write(str , '\n');
+		this[key].flush();
+	};
+	setIndex = function (index) {
+		this.index = index;
+		this.iniBtn.write("VPN_INDEX", "key", index);
+	};
+	loadFile = function (path, vpnLinkUser, vpnLinkPsw) {
+		var vpnTab = {};
+		var tab = ..string.split(..string.load(path), '\r');
+		var reg = //([^\s|,]+)
+		for i=1; #tab; 1 {
+			var line = ..string.trim(tab[i]);
+			if (#line) {
+				var j = 1;
+				var tmp = {};
+				for gm in ..string.gmatch(line, reg) {
+					..table.push(tmp, gm);
+				}
+				if (#tmp[1] == 0) continue;
+				tmp[2] = tmp[2] || vpnLinkUser;
+				tmp[3] = tmp[3] || vpnLinkPsw;
+				..table.push(vpnTab, {..string.join(tmp, " ");0;0;0;0});
+			}
+		}
+		this.vpnTab = vpnTab;
+		this.setIndex(0);
+		this.isChange = false;
+	};
+	stop = function () {
+		if(this.ipHander) {
+			..thread.closehandle(this.ipHander);
+			this.ipHander = null;
+		}
+	};
+	resume = function () {
+		if(this.ipHander) {
+			..thread.resume(this.ipHander);
+		}
+	};
+	pause = function () {
+		if(this.ipHander) {
+			..thread.suspend(this.ipHander);
+			return true;
+		}
+		return false;
+	};
+	changeIp = function () {
+		this.isChange = true;
+		while(true) {
+			var vpnStr = this.getNextIp();
+			if (vpnStr === false)  return false; //无IP可用
+			..console.log(tostring(..time()), "vpn拨号开始", vpnStr);
+			this.ipHander = ..thread.create(this.changeIp_, this.rasdialPath, vpnStr, this.id_vpn);
+			..thread.waitOne(this.ipHander);
+			if (!this.ipHander) return;
+			..raw.closehandle(this.ipHander);
+			var res = ..thread.get(this.id_vpn)
+			this.ipHander = null;
+			
+			..console.log(tostring(..time()), "vpn拨号结束", vpnStr, res ? '拨号成功' : '拨号失败');
+			this.vpnTab[this.index][2]++;
+			if (res == true) {
+				this.vpnTab[this.index][3]++;
+				return true;
+			} else {
+				this.writeIPFile('ipDisConnect', vpnStr)
+			}
+		}
+	};
+	getNextIp = function () {
+		var vpnTab = this.vpnTab;
+		var len = #vpnTab
+		var index = this.index;
+		for (i = 1; len; 1) {
+			var j = (index + i) % len;
+			if (j == 0) {
+				j = len;
+			}
+			this.setIndex(j);
+			return vpnTab[j][1];
+		}	
+		return false;//无IP可用
+	};
+	changeIp_ = function (rasdialPath, vpnStr, id_vpn) {
+		import thread;
+		import inet.ras;
+		import process;
+		import process.popen;
+		
+		var linkName = "nexonvpn";
+		var t = ..string.split(vpnStr, ' ');
+		inet.ras.setEntry(
+			type = 2/*_RASET_Vpn*/; 
+			fOptions =  0x10/*_RASEO_RemoteDefaultGateway*/ | 0x100/*_RASEO_ModemLights*/ | 0x200/*_RASEO_SwCompression*/ | 0x800/*_RASEO_RequireMsEncryptedPw*/ | 0x1000000/*_RASEO_PreviewUserPw*/ | 0x400/*_RASEO_RequireEncryptedPw*/ | 0x20000000/*_RASEO_RequireMsCHAP2*/;
+			fOptions2 = 0x2000000/*_RASEO2_CacheCredentials*/;
+			vpnStrategy = 2/*_VS_PptpFirst*/;
+			deviceType = "VPN";
+			deviceName = "VPN"; 
+			localPhoneNumber = t[1];
+			entryName = linkName;
+		);
+		var linkUser = t[2];
+		var linkPsw = t[3];
+		if (#linkName > 0) {
+			var prcs = process.popen( , rasdialPath ++ " " ++ linkName ++ " /DISCONNECT"); 
+			var line = prcs.read();
+			while(line){
+				sleep(1);//产生进度的效果
+				line =  prcs.read();
+			}
+			sleep(1000);
+			var prcs = process.popen( , rasdialPath ++ " " ++ linkName ++ " " ++ linkUser ++ " " ++ linkPsw ); 
+			var line = prcs.read();
+			while(line){
+				sleep(1);//产生进度的效果
+				line =  prcs.read();
+				if (line && ..string.find(line, "hh netcfg.chm")) {
+					thread.set(id_vpn, false)
+					return;
+				}
+			}
+		}
+		thread.set(id_vpn, true)
+		return;
+	}
+};

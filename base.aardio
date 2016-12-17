@@ -1,0 +1,782 @@
+﻿namespace nexon;
+import console;
+import web.json;
+import thread;
+import thread.works;
+import fsys;
+import fsys.ini;
+import fsys.dlg;
+import config;
+import nexon.vpn;
+import nexon.iplog;
+
+var clog = ..console.log;
+var noop = function () {};
+var noop2 = function () {return false;};
+var tbpush = ..table.push;
+var threadSet = ..thread.set;
+
+fsys.createDir("/exprot");
+base = class {
+	ctor(ide_opt) {
+		this.ipAgain = false;
+		this.getfiles = ide_opt.getfiles;
+		this.beforeThread = ide_opt.beforeThread || noop;
+		this.beforeStart = ide_opt.beforeStart || noop;
+		this.getTestObj = ide_opt.getTestObj || noop2;
+		
+		this.actionName = ide_opt.actionName;
+		this.writeMessage = ide_opt.writeMessage;
+		
+		this.vpn = ..nexon.vpn();
+		this.iplog = ..nexon.iplog()
+		
+		var collectForm = ide_opt.collectForm;
+		var configForm = ide_opt.configForm;
+		collectForm.bindConfig(..config.collectform,{
+			edit = "text";
+		});
+		configForm.bindConfig(..config.configform,{
+			edit = "text"; //绑定edit控件的text属性值到配置文件
+			radiobutton = "checked";
+		});
+		
+		collectForm.fileBtn.oncommand = function(id,event){
+			this.setLoadFile();
+		};
+		collectForm.startBtn.oncommand = function(id,event){
+			this.start();
+		};
+		collectForm.pauseBtn.oncommand = function(id,event){
+			this.pause();
+		};
+		collectForm.stopBtn.oncommand = function(id,event){
+			this.stop();
+		};
+		collectForm.restartBtn.oncommand = function(id,event){
+			this.start(true);
+		};
+		ide_opt.configForm.vpnBtn.oncommand = function(id,event){
+			this.setLoadVPNFile();
+		};
+		this.ini = ..fsys.ini("\配置文件.ini");
+		this.sec = this.ini.getSection(ide_opt.actionName);
+	};
+	init = function () {
+		this.state = 'init';
+		this.setIcon();
+		var listview = ide_opt.collectForm.listview;
+		var showTrs = ide_opt.showTrs;
+		listview.insertColumn("#", 50, ,0x0/*_LVCFMT_LEFT*/)
+		for (i = 1; #showTrs; 1) {
+			listview.insertColumn(showTrs[i].name, 120, ,0x0/*_LVCFMT_LEFT*/)
+		}
+		listview.insertColumn("状态", -1, ,0x0/*_LVCFMT_LEFT*/)
+		
+		var configForm = ide_opt.configForm;
+		var vpnFilePath = configForm.vpnTxt.text;
+		if (#vpnFilePath) {
+			var f = ..io.open(vpnFilePath);
+			if (f) {
+				f.close();
+				var vpnIndex = this.ini.read("VPN_INDEX", "key") || 1;
+				this.vpn.loadFile(vpnFilePath, configForm.vpnName.text, configForm.vpnPsw.text);
+				this.vpn.setIndex(vpnIndex - 1)
+			}
+		}
+	};
+	close = function () {
+		this.state = 'close';
+		this.vpn.close();
+		this.quit();
+	};
+	setLoadFile = function () {
+		if (this.state != 'stop' && this.state != 'init') {//停止
+			clog('运行状态不能导入文件');
+		} else {
+			var file = ..fsys.dlg.open();
+			if (file && #file) {
+				ide_opt.collectForm.fileTxt.text = file;
+				this.loadFile();
+			}
+		}
+	};
+	loadFile = function (isRestart = false) {//加载采集文件
+		if (this.readFile) 
+			this.readFile.close();
+
+		var path  = ide_opt.collectForm.fileTxt.text;
+		if (#path == 0) {
+			clog('采集文件不存在');
+			return false;
+		}
+		this.readFile = ..io.open(path);
+		if (!this.readFile) {
+			clog('采集文件不存在');
+			return false;
+		}
+		this.fileName = ..io.splitpath(path).name;
+		this.getfiles();//创建结果文件
+		
+		this.useTime = 0;//当次采集使用时间，用于时速，每天计算
+		this.doneNum = 0;//当次采集完成个数，用于时速，每天计算
+		
+		var totleNum = 0;
+		var readFile = this.readFile;
+		while(readFile.read() != null) {
+			totleNum++;
+		}
+		this.totleNum = totleNum;
+		readFile.seek("set");
+		
+		this.showDoneNum = 0;//累计采集完成个数，hasDoneTab恢复
+		if (!isRestart) {
+			this.hasDoneTab = {0};
+			this.sec.hasDoneTab = "0";
+			this.sec.save();
+		}
+		ide_opt.collectForm.listview.clear();
+		this.rushInfoLoadData();
+		return true;
+	};
+	stopThread = function () {
+		this.state = "stop";
+		this.setIcon();
+		clog(tostring(..time()), '采集停止');
+		
+		this.lineIndex = 0;
+		this.readFile.seek("set");
+		this.dataTab = {};
+		this.listTab = {};
+		this.useTime = this.useTime + tonumber(..time()) - this.startTime;
+		this.startTime = 0;
+		this.rushInfoLoadData();
+		this.quit();
+	};
+	start = function (isRestart = false) {
+		var state = this.state;
+		var collectForm = ide_opt.collectForm;
+		var configForm = ide_opt.configForm;
+		
+		if (state == 'init' || state == 'stop') {//可以开始
+			if (!this.readFile) {
+				var path  = ide_opt.collectForm.fileTxt.text;
+				if (#path) {
+					if (!this.loadFile(isRestart)) {
+						clog('先选择加载的文件');
+						return false;
+					}
+				} else {
+					clog('先选择加载的文件');
+					return false;
+				}
+			}
+			
+			//采集前初始化参数配置, thread变量
+			..config.collectform.save();
+			..config.configform.save();
+			threadSet("CHANGE_IP_nextDelay", tonumber(configForm.delayNum.text)||0);
+			this.beforeStart();
+			
+			var configForm = ide_opt.configForm;
+			var collectForm = ide_opt.collectForm;
+			var checkNum = tonumber(configForm.checkNum.text)||0; //线程数量
+			if (checkNum == 0) {
+				clog('线程数量设置错误, 不能为0');
+				return false;
+			}
+			var checkIPNum = tonumber(configForm.checkIPNum.text) || 0; //单ip采集使用次数
+			if (!isRestart) {
+				var startNum = tonumber(collectForm.beginTxt.text) || 0; //采集开始位置
+				if (startNum <= 0) {
+					startNum = 1;
+					collectForm.beginTxt.text = 1;
+					clog('开始记录行数<=0,程序自动设置为1开始');
+				} else if (startNum != 1) {
+					startNum--;
+					this.hasDoneTab = {startNum};
+					this.sec.hasDoneTab = "" ++ startNum;
+					this.sec.save();
+					this.showDoneNum = startNum;
+					this.rushInfoLoadData();
+				}
+			} else {
+				this.hasDoneTab = ..string.split(this.sec.hasDoneTab, ",");
+				if (#this.hasDoneTab > 0) {
+					for (i =1 ;#this.hasDoneTab ;1) {
+						this.hasDoneTab[i] = tonumber(this.hasDoneTab[i]);
+					}
+					this.showDoneNum = #this.hasDoneTab - 1 + this.hasDoneTab[1];
+				}
+				this.rushInfoLoadData();
+			}
+			var readFile = this.readFile;
+			readFile.seek("set");
+			this.lineIndex = this.hasDoneTab[1];//文件移动到指定位置
+			if (this.lineIndex >= this.totleNum) {
+				clog('开始记录行数>文件总行数');
+				this.lineIndex = 0;
+				return false;
+			}
+			for (i = 1; this.lineIndex; 1) {
+				if (readFile.read() == null) {
+					clog('开始记录行数>文件总行数');
+					readFile.seek("set");
+					this.lineIndex = 0;
+					return false;
+				}
+			}
+			
+			this.state = 'run';
+			this.setIcon();
+			clog(tostring(..time()), '采集开始');
+			//owner.fileAll.write("=====================开始时间:", tostring(..time()) , '=====================\n');
+			//owner.fileAll.flush();
+			this.startTime = tonumber(..time());
+			this.useTime = 0;
+			this.doneNum = 0;
+			
+			
+			this.dataTab = {};//数据信息
+			this.lineMap = {};//原始line信息
+			this.listTab = {};//数据排位信息
+			this.quit();
+			
+			
+			collectForm.listview.clear();
+			this.testObj = this.getTestObj();//数据占位
+			if (this.testObj) {
+				var obj = this.testObj;
+				obj.flag = 0;
+				obj.index = 'T';
+				this.dataTab[obj.index] = obj
+				this.addListItem(obj);
+			}
+			
+			
+			this.workNum = checkNum;
+			if (checkIPNum != 0 && checkIPNum < checkNum) {
+				this.workNum = checkIPNum;
+			}
+			this.manage = ..thread.works(this.workNum, ide_opt.threadFun);//测试号线程
+			this.startThread();
+		} else if (state == "pause") {
+			this.state = 'run';
+			this.setIcon();
+			clog(tostring(..time()), '采集继续');
+			this.startTime = tonumber(..time());
+			this.manage.resume();
+			this.resumeThread();
+		}
+	};
+	startThread  = function () {
+		var dataTab = this.dataTab;
+		var lineMap = this.lineMap;
+		var listTab = this.listTab;
+		
+		var listview = ide_opt.collectForm.listview;
+		if (#listTab > 50) {
+			var j = 0;
+			var len = #listTab - 50;
+			for(i = #listTab; 1;-1) {
+				if (!dataTab[listTab[i]]) {//已完成
+					..table.remove(listTab, i);
+					listview.delItem(i);
+					j++;
+				}
+				if (len == j) break;
+			}
+		}
+		
+		threadSet("VPN_AGAIN", 1);
+		this.resumeThread = noop;//恢复采集函数，只在没有vpn资源后恢复，需要重启采集线程
+		this.iplog.clear();
+		
+		var configForm = ide_opt.configForm;
+		var checkNum = tonumber(configForm.checkNum.text)||0;
+		var checkIPNum = tonumber(configForm.checkIPNum.text)||0;
+		
+		this.isLineEnd = false;
+		var loadNames = ide_opt.loadNames;
+		var loadNamesLen = #loadNames;
+		var workNum = this.workNum;
+		var readFile = this.readFile;
+		var dataLen = ide_opt.dataLen;
+		var reg = //([^\s|,]+)
+		var i = 0;
+		
+		//历史信息处理，暂停，继续情况
+		//测试帐号
+		
+		
+		
+		for (key , obj in dataTab) {
+			obj.flag = 0;
+			this.manage.push(obj);
+			this.iplog.use();
+			i++;
+		}
+		if (this.testObj) {
+			this.testObj.msg = '测试帐号检测IP...'
+			this.showLogView(this.testObj);
+		}
+		
+		while (true) {
+			if (i >= workNum) break;
+			if (checkIPNum != 0 && this.iplog.numUse > checkIPNum) {
+				break;
+			}
+			var line = readFile.read();
+			this.lineIndex++;
+			
+			if (line == null) {
+				this.isLineEnd = true;
+				break;
+			}
+			if (..table.find(this.hasDoneTab, this.lineIndex)) {//start文件已经定位到最小位置
+				continue;
+			}
+			var obj = {};
+			var j = 1;
+			line = ..string.trim(line);
+			for gm in ..string.gmatch(line, reg) {
+				if (j > loadNamesLen) {
+					break;
+				}
+				obj[loadNames[j]] = gm;
+				j++;
+			}
+			if (j <= dataLen) {
+				continue;
+			}
+			obj.index = this.lineIndex;
+			obj.flag = 0;
+			if (this.beforeThread(obj) == true) {
+				continue;
+			}
+			dataTab[obj.index] = obj;
+			lineMap[obj.index] = line;
+			this.addListItem(obj);
+			this.manage.push(obj);
+			this.iplog.use();
+			i++;
+		}
+		this.manage.wait(this.onEnd);//等待所有线程完成
+
+		this.rushInfoLoadData();
+		var state = this.state;
+		var flag = false;
+		for (key , obj in dataTab) {
+			if (key == 'T') continue;
+			flag = true;
+			break;
+		}
+		if (state == 'stop') {
+			this.stopThread();//完成
+		} else if (this.isLineEnd && !flag) {
+			this.stopThread();//完成
+		} else { //拨号继续
+			if (configForm.changipNo.checked) {
+				this.iplog.ipInfo();
+				if (this.state == 'run') {
+					this.pause();
+				}
+			} else {
+				this.iplog.ipInfo();
+				this.vpn.setVpn(this.iplog);
+				if (this.state == 'run') {
+					var res = this.vpn.changeIp();
+					if (this.state == 'run') {
+						if (res == false) {
+							this.vpnLess()
+						} else {
+							this.startThread()
+						}
+					}
+				}
+				
+			}
+		}
+	};
+	onTestEnd = function (res) {
+		var iplog = this.iplog;
+		var dataTab = this.dataTab;
+		var obj = dataTab[res.index];
+		obj.flag = res.flag;
+
+		this.showLogView(res);//显示错误信息
+		
+		if (res.flag == -40) { //当前IP不可用，请求接口, 无返回信息
+			iplog.num40++;
+			if (this.ipAgain) {
+				threadSet("VPN_AGAIN", 2);
+				clog(tostring(..time()), '网络不可用，终止重发请求');
+			}
+		} else if (res.flag == -60) {//ip被封，需要更换ip
+			iplog.num60++;
+			thread.set("VPN_ISOK", 0);
+		} else {
+			this.getNextUser();
+			for (key , obj in dataTab) {
+				if (obj.flag == -201) {
+					this.writeFile(obj);
+				}
+			}
+		}
+	};
+	writeFile = function (res) {
+		var lineMap = this.lineMap;
+		var iplog = this.iplog;
+		var dataTab = this.dataTab;
+		var obj = dataTab[res.index];
+
+		iplog.canUse++;
+		this.doneNum++;
+		this.showDoneNum++;
+		this.setHasDone(obj);
+		this.writeMessage(obj, res);//写文件
+		dataTab[res.index] = null;
+		lineMap[res.index] = null;
+	};
+	getNextUser = function () {
+		if (this.state != "run") return;
+		var lineMap = this.lineMap;
+		var iplog = this.iplog;
+		var dataTab = this.dataTab;
+		
+		var checkIPNum = tonumber(ide_opt.configForm.checkIPNum.text) || 0;
+		if (checkIPNum != 0 && iplog.numUse >= checkIPNum) {
+			//..console.log('单拨号采集数量超出限制');
+		} else {
+			if (iplog.num60 == 0) {
+				var loadNames = ide_opt.loadNames;
+				var loadNamesLen = #loadNames;
+				var readFile = this.readFile;
+				var dataLen = ide_opt.dataLen;
+				var reg = //([^\s|,]+)
+				while (true) {
+					var line = readFile.read();
+					if (line == null) {
+						this.isLineEnd = true;
+						break;
+					}
+					this.lineIndex++;
+					if (..table.find(this.hasDoneTab, this.lineIndex)) {
+						continue;
+					}
+					var obj = {};
+					var j = 1;
+					line = ..string.trim(line);
+					for gm in ..string.gmatch(line, reg) {
+						if (j > loadNamesLen) {
+							break;
+						}
+						obj[loadNames[j]] = gm;
+						j++;
+					}
+					if (j <= dataLen) {
+						continue;
+					}
+					obj.index = this.lineIndex;
+					obj.flag = 0;
+					if (this.beforeThread(obj) == true) {
+						continue;
+					}
+					dataTab[obj.index] = obj;
+					lineMap[obj.index] = line;
+					this.addListItem(obj);
+					this.manage.push(obj);
+					this.iplog.use();
+					break;
+				}
+			}
+		}
+	};
+	onEnd = function (res) {
+		if (res.index == 'T') {
+			this.onTestEnd(res);
+			return;
+		}
+		
+		var iplog = this.iplog;
+		var dataTab = this.dataTab;
+		var obj = dataTab[res.index];
+		if (!obj) {//不明逻辑错误导致
+			this.getNextUser();
+			clog(tostring(..time()), '不明逻辑错误1', res.index);
+			return;
+		}
+		obj.flag = res.flag;
+
+		this.showLogView(res);//显示错误信息
+		if (res.flag == -40) { //当前IP不可用，请求接口, 无返回信息
+			iplog.num40++;
+			//是否进行重新采集
+		} else if (res.flag == -60) {//ip被封，需要更换ip
+			iplog.num60++;
+		} else {
+			var getNextId = 0;
+			if (res.flag == 0) {//未知错误
+				this.getNextUser();
+				clog(tostring(..time()), '不明逻辑错误2', res.index);
+			} else if (res.flag == -201){
+				//测试帐号还在检测 或 IP正常
+				if (this.testObj) {
+					if (this.testObj.flag == 0) {
+						if (iplog.canUse) {//有其他线程完成采集
+							getNextId = 1;
+						} else {
+							getNextId = 2;
+						}
+					} else if (this.testObj.flag == 1) {
+						getNextId = 1;
+					}
+				} else {
+					getNextId = 1;
+				}
+			} else {
+				getNextId = 1;
+			}
+			if (getNextId == 1) {
+				this.writeFile(res);
+			}
+			if (getNextId > 0) {
+				this.getNextUser();
+			}
+		}
+		
+		var nowTime = tonumber(..time());
+		this.useTime = this.useTime + nowTime - this.startTime;	
+		this.startTime = nowTime;
+		this.rushInfoLoadData();
+		res = null;
+		
+		if (!ide_opt.configForm.getAgainNo.checked) {
+			var flag = 1;//需要阻止重新采集
+			for (key , obj in dataTab) {//历史信息处理，暂停，继续情况
+				if (obj.flag === 0) {
+					flag = 0;//还在进行中
+					break;
+				}
+				if (key == 'T') continue;
+				if (obj.flag === -40) {
+				} else {
+					flag = -1;//网络有返回状态
+				}
+			}
+			if (flag == 1) {
+				if (this.ipAgain) {
+					threadSet("VPN_AGAIN", 2);
+					clog(tostring(..time()), '网络不可用，终止重发请求');
+				}
+			} else {
+				if (obj.flag === -40) {//重新采集
+					this.iplog.use();
+					this.manage.push(obj);
+				}
+			}
+		}
+	};
+	stop = function () {
+		if (this.state == 'run' || this.state == 'pause') {
+			this.state = "stop";
+			this.setIcon();
+			this.vpn.stop();
+			this.quit();
+			clog(tostring(..time()), '采集停止');
+		}
+	};
+	quit = function () {
+		if (this.manage) {
+			this.manage.quit();
+			this.manage = null;
+			this.workNum = 0;
+		}
+	};
+	pause = function () {
+		if (this.state == 'run') {
+			this.state = "pause";
+			this.setIcon();
+			this.useTime = this.useTime + tonumber(..time()) - this.startTime;
+			this.startTime = 0;
+			this.pauseThread();
+		}
+	};
+	pauseThread = function () {
+		this.manage.suspend();
+		if (this.vpn.pause()) {
+			this.resumeThread = this.vpn.resume;
+		} else {
+			this.resumeThread = noop;
+		}
+		clog(tostring(..time()), '采集暂停');
+	};
+	showLogView = function (res) {
+		var listview = ide_opt.collectForm.listview;
+		var flag = res.flag;
+		var text = "";
+		if (flag == -40 || flag == -60) {
+			text = '换IP';
+		} else if (flag == -50) {
+			text = '授权过期';
+		} else {
+			text = res.msg || '未知状态';
+		}
+		listview.setItemText(text, ..table.find(this.listTab, res.index) , #ide_opt.showTrs + 2)
+	};
+	setHasDone = function (obj) {//不知道内存有没占用
+		tbpush(this.hasDoneTab, obj.index);
+		var len = #this.hasDoneTab;
+		if (len > 1) {
+			..table.sort(this.hasDoneTab);
+			var tab = {};
+			var min = this.hasDoneTab[1];
+			var flag = false;
+			for (i = 2; len; 1) {
+				if (!flag) {
+					if (this.hasDoneTab[i] == min + 1) {
+						min = min + 1;
+					} else {
+						flag = true;
+						tbpush(tab, min, this.hasDoneTab[i]);
+					}
+				} else {
+					tbpush(tab, this.hasDoneTab[i]);
+				}
+			}
+			if (!flag) {
+				tbpush(tab, this.hasDoneTab[len]);
+			}
+			this.hasDoneTab = tab;
+		}
+		this.sec.hasDoneTab = ..string.join(this.hasDoneTab, ',');
+		this.sec.save();
+	};
+	vpnLess = function () {
+		clog("VPN资源已用完，资源已清空，程序已暂停，请重新导入，点击开始")
+		//this.resumeThread = this.startThread;
+		this.pause();
+		var configForm = ide_opt.configForm;
+		configForm.vpnBtn.disabled = 0;
+		configForm.vpnName.disabled = 0;
+		configForm.vpnPsw.disabled = 0;
+	};
+	setLoadVPNFile = function () {
+		if (this.state != 'stop' && this.state != 'init' && this.state != 'pause' ) {//停止
+			clog('运行状态不能导入VPN文件');
+		} else {
+			var file = ..fsys.dlg.open();
+			if (file && #file) {
+				ide_opt.configForm.vpnTxt.text = file;
+				this.vpn.loadFile(ide_opt.configForm.vpnTxt.text, configForm.vpnName.text, configForm.vpnPsw.text);
+			}
+		}
+	};
+	rushInfoLoadData = function () {
+		if (this.state == 'close') return;
+		var mainForm = ide_opt.mainForm;
+		mainForm.loadDataTxt.text = this.showDoneNum++ "/" ++ this.totleNum;
+		if (this.doneNum > 0) {
+			var num = ..math.round((this.doneNum/this.useTime)*3600 * 100)/100;
+			mainForm.downHourTxt.text = num;
+			mainForm.downDayTxt.text = ..math.floor(24*num);
+		} else {
+			mainForm.downHourTxt.text = '0';
+			mainForm.downDayTxt.text = '0';
+		}
+	};
+	setIcon = function () {
+		var configForm = ide_opt.configForm;
+		var collectForm = ide_opt.collectForm;
+		var state = this.state;
+		if (state == 'init') {
+			collectForm.fileBtn.disabled = 0;
+			collectForm.beginTxt.disabled = 0;
+			collectForm.startBtn.disabled = 0;
+			collectForm.pauseBtn.disabled = 1;
+			collectForm.stopBtn.disabled = 1;
+			collectForm.restartBtn.disabled = 0;
+			configForm.changipNo.disabled = 0;
+			configForm.changipOk.disabled = 0;
+			configForm.checkIPNum.disabled = 0;
+			configForm.checkName.disabled = 0;
+			configForm.checkNum.disabled = 0;
+			configForm.checkPsw.disabled = 0;
+			configForm.delayNum.disabled = 0;
+			configForm.vpnBtn.disabled = 0;
+			configForm.vpnName.disabled = 0;
+			configForm.vpnPsw.disabled = 0;
+		} else if (state == 'run') {
+			collectForm.fileBtn.disabled = 1;
+			collectForm.beginTxt.disabled = 1;
+			collectForm.startBtn.disabled = 1;
+			collectForm.pauseBtn.disabled = 0;
+			collectForm.stopBtn.disabled = 0;
+			collectForm.restartBtn.disabled = 1;
+			configForm.changipNo.disabled = 1;
+			configForm.changipOk.disabled = 1;
+			configForm.checkIPNum.disabled = 1;
+			configForm.checkName.disabled = 1;
+			configForm.checkNum.disabled = 1;
+			configForm.checkPsw.disabled = 1;
+			configForm.delayNum.disabled = 1;
+			configForm.vpnBtn.disabled = 1;
+			configForm.vpnName.disabled = 1;
+			configForm.vpnPsw.disabled = 1;
+		} else if (state == 'pause') {
+			collectForm.fileBtn.disabled = 1;
+			collectForm.beginTxt.disabled = 1;
+			collectForm.startBtn.disabled = 0;
+			collectForm.pauseBtn.disabled = 1;
+			collectForm.stopBtn.disabled = 0;
+			collectForm.restartBtn.disabled = 1;
+			configForm.changipNo.disabled = 1;
+			configForm.changipOk.disabled = 1;
+			configForm.checkIPNum.disabled = 1;
+			configForm.checkName.disabled = 1;
+			configForm.checkNum.disabled = 1;
+			configForm.checkPsw.disabled = 1;
+			configForm.delayNum.disabled = 1;
+			configForm.vpnBtn.disabled = 1;
+			configForm.vpnName.disabled = 1;
+			configForm.vpnPsw.disabled = 1;
+		} else if (state == 'stop') {
+			collectForm.fileBtn.disabled = 0;
+			collectForm.beginTxt.disabled = 0;
+			collectForm.startBtn.disabled = 0;
+			collectForm.pauseBtn.disabled = 1;
+			collectForm.stopBtn.disabled = 1;
+			collectForm.restartBtn.disabled = 0;
+			configForm.changipNo.disabled = 0;
+			configForm.changipOk.disabled = 0;
+			configForm.checkIPNum.disabled = 0;
+			configForm.checkName.disabled = 0;
+			configForm.checkNum.disabled = 0;
+			configForm.checkPsw.disabled = 0;
+			configForm.delayNum.disabled = 0;
+			configForm.vpnBtn.disabled = 0;
+			configForm.vpnName.disabled = 0;
+			configForm.vpnPsw.disabled = 0;
+		}
+	};
+	addListItem = function (obj) {
+		if (this.state == 'close') return;
+		
+		var listview = ide_opt.collectForm.listview;
+		var showTrs = ide_opt.showTrs;
+		var res = {obj.index};
+		for (i = 1; #showTrs; 1) {
+			tbpush(res, obj[showTrs[i].key]);
+		}
+		tbpush(res, '');
+		
+		var index = this.testObj?2:1;
+		if (obj.index == 'T') {
+			index = 1;
+		}
+		..table.insert(this.listTab, obj.index, index);
+		return listview.addItem({
+			text = res
+		}, index)
+	};
+};

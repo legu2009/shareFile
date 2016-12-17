@@ -1,0 +1,31 @@
+﻿namespace nexon;
+import console;
+import thread;
+var clog = ..console.log;
+var threadSet = ..thread.set;
+//线程使用数，网络不可用，是否被封
+iplog = class {
+	ctor(ide_opt) {
+		this.numUse = 0;
+		this.num40 = 0;
+		this.num60 = 0;
+		this.canUse = 0;
+	};
+	clear =  function () {
+		this.numUse = 0;
+		this.num40 = 0;
+		this.num60 = 0;
+		threadSet("VPN_ISOK", 1);
+	};
+	use = function () {
+		this.numUse++;
+	};
+	ipInfo = function () {
+		if (this.num60) {
+			clog(tostring(..time()), '当前IP被封');
+		} else {
+			clog(tostring(..time()), '当前IP使用' + this.numUse + '次,网络不响应' +  this.num40 + '次' );
+		}
+	};
+	
+};
